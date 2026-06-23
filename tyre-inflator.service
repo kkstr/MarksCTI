@@ -1,0 +1,18 @@
+[Unit]
+Description=4WD Tyre Pressure Monitor & Auto-Inflator
+After=multi-user.target
+
+[Service]
+Type=simple
+# Adjust User and WorkingDirectory to wherever the script lives.
+User=pi
+WorkingDirectory=/home/pi/MarksCTI
+ExecStart=/usr/bin/python3 /home/pi/MarksCTI/tyre_inflator.py
+Restart=on-failure
+RestartSec=5
+# Give threads a moment to close solenoids + stop the compressor on stop.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
