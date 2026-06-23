@@ -19,6 +19,14 @@ controls above road speed.
 - **GPS speed-based lockout** (u-blox NEO-6M) in two stages so settings can't be
   changed while driving — but pressure regulation never stops.
 - **Puncture vs. compressor-failure heuristic** with silenceable warnings.
+- **Demand-based compressor control** — the compressor runs only while a corner
+  actually needs to inflate (with a short linger to avoid chatter), not for the
+  whole time the Pi is powered.
+- **Self-healing sensor fault detection** — a sensor voltage outside its valid
+  0.5–4.5 V band (disconnected/shorted) is treated as a fault (`ERR`, solenoids
+  closed) instead of a bogus 0 psi, and clears automatically when it recovers.
+
+Full system/wiring/setup detail lives in [`OVERVIEW.txt`](OVERVIEW.txt).
 
 ## Lockout stages
 
@@ -88,8 +96,9 @@ Drop these next to the script (they're gitignored):
 
 This drives a live air system on a moving vehicle. Solenoids and the compressor
 default to **off/closed** at startup and are closed again on clean shutdown
-(`SIGINT`/`SIGTERM`). Bench-test each corner before trusting it on a wheel, and
-make sure your air hardware fails closed if power is lost.
+(`SIGINT`/`SIGTERM`). A failed or disconnected sensor faults its corner rather
+than inflating blindly. Bench-test each corner before trusting it on a wheel,
+and make sure your air hardware fails closed if power is lost.
 
 ## License
 

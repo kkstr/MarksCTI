@@ -1,152 +1,19 @@
 #!/usr/bin/env python3
 """
 4WD Tyre Pressure Monitor & Auto-Inflator — Raspberry Pi 5
-============================================================
 
-SYSTEM OVERVIEW
-============================================================
-- 1x SSD1309 OLED (I2C): 4WD outline with live pressure at each wheel,
-  a preset bar (ROAD/DIRT/SAND/CUSTOM) at the bottom, and a header
-  showing current GPS speed + lockout stage. Flashes full-screen
-  warnings for suspected punctures / compressor failure (see below).
-- 1x DFRobot Gravity ADS1115 4-channel ADC reading pressure sensors
-  (0.5-4.5V = 0-150psi), one sensor per tyre.
-- Air solenoids (inflate + deflate per corner) via relay/MOSFET boards.
-- 1x MOSFET power-switch module turning the air compressor on/off (it
-  has its own pressure-switch cutout, so the Pi just powers it on/off).
-- 3x momentary push buttons: UP, DOWN, SELECT (preset cycle / axle focus
-  / silence warnings — see WARNINGS section).
-- 1x u-blox NEO-6M GPS module (UART/NMEA) for speed-based lockout.
+Full system overview, wiring, lockout/warning behaviour and setup notes
+live in OVERVIEW.txt next to this script. Quick summary:
 
-============================================================
-SPEED-BASED LOCKOUT (2-stage)
-============================================================
-    Stage 0  (< 20 km/h)   : full access — all presets, all buttons.
-    Stage 1  (20-80 km/h)  : only ROAD/DIRT/SAND selectable (CUSTOM
-                              skipped). UP/DOWN can still fine-tune
-                              whichever is active.
-    Stage 2  (> 80 km/h)   : buttons fully locked out — UP/DOWN/SELECT
-                              do nothing (except silencing a warning —
-                              see below).
-
-  IMPORTANT: the lockout ONLY ever gates the buttons/UI. Sensor
-  monitoring and the automatic inflate/deflate control loop keep
-  running at every speed, including above 80 km/h — a tyre that's off
-  target keeps getting corrected regardless of lockout stage. "Locked
-  out" means the driver can't change settings while moving, not that
-  the system stops maintaining pressure.
-
-  FAIL-SAFE: no valid GPS fix, or no data for GPS_FIX_TIMEOUT_SECONDS,
-  -> speed treated as UNKNOWN -> falls back to Stage 2 (most
-  restrictive button lockout), never assumed to be 0 km/h.
-
-============================================================
-WARNINGS: puncture vs. possible compressor failure
-============================================================
-Previously a corner that couldn't reach its target within
-WARNING_TRIGGER_SECONDS just gave up and parked itself. That's been
-replaced with:
-
-  - The corner KEEPS TRYING indefinitely — it never stops attempting to
-    inflate a tyre that's losing pressure. There's no permanent "fault
-    lock" for this case anymore (sensor read errors are still a hard
-    fault, since there's no pressure data to safely act on at all).
-
-  - After WARNING_TRIGGER_SECONDS of continuously trying to inflate
-    without reaching target, the system tries to work out why:
-        * If a tyre on the OTHER axle is inflating/holding fine ->
-          this is a LOCAL problem -> "<POSITION> TYRE PUNCTURE".
-        * If no other-axle tyre can be confirmed working either ->
-          "POSSIBLE COMPRESSOR FAILURE" (system-wide, not tied to one
-          wheel).
-      (This is a simple heuristic based on whether other corners
-      currently have their own active warning, not an active
-      diagnostic test of the other axle — a reasonable first pass
-      given the hardware available.)
-      NOTE: with only one corner wired up for testing right now, there
-      is no "other axle" to check, so any prolonged inflate struggle on
-      the test corner will always resolve to "POSSIBLE COMPRESSOR
-      FAILURE" until a second corner (on the other axle) is wired in.
-
-  - Whichever warning fires, the OLED flashes it full-screen: white
-    background, black text, 2 seconds on / 2 seconds back to the
-    normal dashboard, looping for as long as the condition is active.
-    The flashing screen shows "Push any button to pause warning" in
-    small text at the bottom.
-
-  - Pressing ANY button while a warning is flashing silences the
-    flashing (that button press does nothing else — it's consumed by
-    the warning) and returns to the normal dashboard, but the affected
-    tyre's pressure reading is now shown in an inverted box (white box,
-    black text) as a persistent reminder. A possible-compressor-failure
-    warning, not being tied to one wheel, inverts the header bar
-    instead. This silencing works even during Stage-2 speed lockout,
-    since you should be able to silence a distracting warning at any
-    speed.
-
-  - The highlight/silence clears automatically once the underlying
-    problem actually resolves (pressure recovers, or another corner
-    proves air is flowing again).
-
-CURRENTLY WIRED FOR TESTING:
-  Only ONE sensor + ONE inflate solenoid + ONE deflate solenoid are
-  physically connected right now (FL / front axle). See ACTIVE_CORNERS
-  below — add "FR", "RL", "RR" once those corners are wired; their GPIO
-  pins are already mapped out and ready to go.
-
-PRESETS:
-  Four named profiles (ROAD/DIRT/SAND/CUSTOM), each storing a front-axle
-  and rear-axle target psi, all fully editable from the buttons and
-  persisted across reboots in tyre_presets.json next to this script.
-
-============================================================
-WIRING
-============================================================
-Air compressor (MOSFET power switch module):
-    Pi GPIO4 -> module signal/IN pin
-
-Pressure sensors -> DFRobot Gravity ADS1115 (I2C, powered from Pi 5V,
-no divider needed — see earlier notes in this conversation):
-    FL sensor -> ADS1115 A0   FR sensor -> ADS1115 A1
-    RL sensor -> ADS1115 A2   RR sensor -> ADS1115 A3
-    ADS1115 SDA/SCL -> Pi SDA(GPIO2)/SCL(GPIO3), address 0x48 default
-
-Solenoids (each via its own relay/MOSFET driver -> 12V/24V supply):
-    FL inflate -> GPIO17   FL deflate -> GPIO27   (<- wired now)
-    FR inflate -> GPIO22   FR deflate -> GPIO23   (not yet wired)
-    RL inflate -> GPIO24   RL deflate -> GPIO25   (not yet wired)
-    RR inflate -> GPIO5    RR deflate -> GPIO6    (not yet wired)
-
-Buttons (momentary, wired to GPIO + GND, internal pull-up used):
-    UP -> GPIO16   DOWN -> GPIO26   SELECT -> GPIO13
-
-OLED display (SSD1309, I2C): shares the bus with the ADS1115 (different
-    address — typically 0x3C or 0x3D). Assumed 128x64 resolution.
-
-GPS (u-blox NEO-6M, UART/NMEA, 9600 baud default):
-    Module VCC -> Pi 3.3V (pin 1)  — do NOT use 5V, chip is 3.3V-only
-    Module GND -> Pi GND
-    Module TX  -> Pi RXD (GPIO15 / physical pin 10)
-    Module RX  -> not connected (only reading data, not configuring it)
-
-============================================================
-SETUP
-============================================================
-    sudo apt update
-    sudo apt install -y python3-lgpio python3-smbus i2c-tools
-    sudo raspi-config
-        # Interface Options -> I2C -> Enable
-        # Interface Options -> Serial Port ->
-        #     "login shell over serial?" -> No
-        #     "serial port hardware enabled?" -> Yes
-        # reboot afterwards
-    pip install gpiozero smbus2 luma.oled pillow pyserial pynmea2 --break-system-packages
-
-    i2cdetect -y 1     # confirm ADS1115 (0x48) and SSD1309 (0x3C/0x3D)
-    cat /dev/serial0    # should show $GPxxx NMEA sentences once GPS has a fix
-
-Run as a systemd service (tyre-inflator.service, provided earlier) so
-the compressor turns on automatically at boot.
+- Per-corner pressure monitoring via an ADS1115 ADC (0.5-4.5V = 0-150psi).
+- Automatic inflate/deflate to ROAD/DIRT/SAND/CUSTOM presets (front/rear
+  targets, persisted to tyre_presets.json).
+- SSD1309 OLED dashboard with a 4WD outline + flashing puncture /
+  compressor-failure warnings.
+- GPS speed-based 2-stage control lockout (UI only — regulation never
+  stops; fail-safe to the most restrictive stage with no fix).
+- Demand-based compressor control and self-healing sensor fault detection
+  (see CompressorController and SENSOR_V_FAULT_* below).
 """
 
 import json
@@ -223,6 +90,10 @@ CORNER_DISPLAY_NAME = {
 
 # --- Compressor ---
 COMPRESSOR_PIN = 4
+COMPRESSOR_LINGER_SECONDS = 5.0   # keep running this long after inflate demand
+                                   # ends, so it doesn't chatter on/off between
+                                   # the individual inflate pulses
+COMPRESSOR_POLL_SECONDS = 0.5      # how often the compressor thread re-checks demand
 
 # --- Solenoid GPIO pins, per corner (all 4 defined; only ACTIVE_CORNERS used) ---
 SOLENOID_PINS = {
@@ -244,6 +115,14 @@ CORNER_AXLE = {"FL": "front", "FR": "front", "RL": "rear", "RR": "rear"}
 SENSOR_V_MIN = 0.5
 SENSOR_V_MAX = 4.5
 PSI_PER_VOLT = 150.0 / (SENSOR_V_MAX - SENSOR_V_MIN)  # 37.5
+
+# A reading outside this (slightly widened) band means the sensor is
+# disconnected/shorted, not a genuine pressure — treat as a fault and do NOT
+# inflate toward a bogus "0psi". Margins allow for a little under/overshoot at
+# the rails before flagging a fault.
+SENSOR_V_FAULT_LOW = 0.25
+SENSOR_V_FAULT_HIGH = 4.75
+SENSOR_SAMPLES = 3   # samples per read; median used to reject noise
 
 # --- Buttons ---
 BUTTON_UP_PIN = 16
@@ -295,6 +174,11 @@ SPLASH_LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spl
 SPLASH_DURATION_SECONDS = 3.0
 
 
+class SensorFault(Exception):
+    """Raised when a sensor reading is outside its valid voltage band
+    (disconnected / shorted) — there's no trustworthy pressure to act on."""
+
+
 # ============================================================
 # Hardware: solenoid
 # ============================================================
@@ -319,6 +203,48 @@ class AirSolenoid:
 
 
 # ============================================================
+# Hardware: compressor power switch (demand-based control)
+# ============================================================
+class CompressorController:
+    """Powers the compressor only while inflation is actually needed.
+
+    Turns on the moment demand appears; turns off COMPRESSOR_LINGER_SECONDS
+    after demand last seen, so brief gaps between inflate pulses don't cause
+    rapid on/off chatter. The compressor's own pressure-switch cutout remains
+    the final mechanical backstop. Starts OFF."""
+
+    def __init__(self, pin: int):
+        self._device = OutputDevice(pin, active_high=True, initial_value=False)
+        self._on = False
+        self._last_demand = 0.0
+
+    def request(self, demand: bool):
+        now = time.monotonic()
+        if demand:
+            self._last_demand = now
+            if not self._on:
+                self._device.on()
+                self._on = True
+                print("[compressor] ON (inflate demand)")
+        elif self._on and (now - self._last_demand) >= COMPRESSOR_LINGER_SECONDS:
+            self._device.off()
+            self._on = False
+            print("[compressor] OFF (idle)")
+
+    def cleanup(self):
+        self._device.off()
+        self._device.close()
+
+
+def compressor_worker(controller: CompressorController, corners: dict,
+                      stop_event: threading.Event):
+    while not stop_event.is_set():
+        demand = any(c.status == "INFLATE" for c in corners.values())
+        controller.request(demand)
+        _interruptible_sleep(COMPRESSOR_POLL_SECONDS, stop_event)
+
+
+# ============================================================
 # Hardware: ADS1115 (4-channel ADC) + pressure sensors
 # ============================================================
 class ADS1115:
@@ -329,17 +255,23 @@ class ADS1115:
     def __init__(self, bus_num: int = ADS1115_BUS, address: int = ADS1115_ADDR):
         self._bus = SMBus(bus_num)
         self._address = address
+        # All corner threads share one ADC. A read is a non-atomic
+        # write-config -> wait -> read-conversion sequence, so it must be
+        # serialised — otherwise two threads selecting different channels at
+        # once would cross-wire their readings.
+        self._lock = threading.Lock()
 
     def read_voltage(self, channel: int) -> float:
         if channel not in (0, 1, 2, 3):
             raise ValueError("channel must be 0-3")
         mux = (4 + channel) << 12
         config = 0x8183 | mux
-        self._bus.write_i2c_block_data(
-            self._address, self._REG_CONFIG, [(config >> 8) & 0xFF, config & 0xFF]
-        )
-        time.sleep(0.01)
-        data = self._bus.read_i2c_block_data(self._address, self._REG_CONVERSION, 2)
+        with self._lock:
+            self._bus.write_i2c_block_data(
+                self._address, self._REG_CONFIG, [(config >> 8) & 0xFF, config & 0xFF]
+            )
+            time.sleep(0.01)
+            data = self._bus.read_i2c_block_data(self._address, self._REG_CONVERSION, 2)
         raw = (data[0] << 8) | data[1]
         if raw > 32767:
             raw -= 65536
@@ -355,7 +287,21 @@ class PressureSensor:
         self._channel = channel
 
     def read_psi(self) -> float:
-        v = self._adc.read_voltage(self._channel)
+        # Take several samples and use the median to reject electrical noise
+        # around the tolerance band. Any single out-of-band sample means the
+        # sensor is disconnected/shorted -> raise SensorFault rather than
+        # report a bogus pressure.
+        readings = []
+        for _ in range(SENSOR_SAMPLES):
+            v = self._adc.read_voltage(self._channel)
+            if v < SENSOR_V_FAULT_LOW or v > SENSOR_V_FAULT_HIGH:
+                raise SensorFault(
+                    f"voltage {v:.3f}V outside valid {SENSOR_V_MIN}-{SENSOR_V_MAX}V band "
+                    "(sensor disconnected or shorted?)"
+                )
+            readings.append(v)
+        readings.sort()
+        v = readings[len(readings) // 2]   # median
         psi = (v - SENSOR_V_MIN) * PSI_PER_VOLT
         return max(0.0, min(150.0, psi))
 
@@ -617,7 +563,7 @@ class TyreCorner:
         self.deflate = deflate
         self.actual_psi = 0.0
         self.status = "--"     # "OK", "INFLATE", "DEFLATE", "FAULT"
-        self.fault = False     # hard fault: sensor read failure (no data to act on)
+        self.fault = False     # sensor read failure / out-of-range (no trustworthy data)
 
     def cleanup(self):
         self.inflate.cleanup()
@@ -640,18 +586,22 @@ def corner_worker(corner: TyreCorner, corners: dict, presets: PresetManager,
         try:
             corner.actual_psi = corner.sensor.read_psi()
         except Exception as exc:
-            # Hard fault: no pressure data at all, nothing safe to act on.
-            print(f"[{corner.name}] sensor read failed: {exc}")
+            # No trustworthy pressure data (I2C error or out-of-range voltage):
+            # close solenoids and wait. Self-healing — the next valid reading
+            # clears the fault automatically (no permanent latch).
+            if not corner.fault:
+                print(f"[{corner.name}] sensor fault: {exc}")
             corner.status = "FAULT"
             corner.fault = True
             corner.inflate.close()
             corner.deflate.close()
+            run_start = None
             _interruptible_sleep(CHECK_INTERVAL_SECONDS, stop_event)
             continue
 
         if corner.fault:
-            _interruptible_sleep(CHECK_INTERVAL_SECONDS, stop_event)
-            continue
+            print(f"[{corner.name}] sensor recovered — resuming control")
+            corner.fault = False
 
         target = presets.get_target(corner.axle)
         diff = target - corner.actual_psi
@@ -961,9 +911,10 @@ def display_loop(device, corners: dict, presets: PresetManager,
 def main():
     stop_event = threading.Event()
 
-    compressor = OutputDevice(COMPRESSOR_PIN, active_high=True, initial_value=False)
-    compressor.on()
-    print("[compressor] ON")
+    # Demand-based: starts OFF, the compressor thread powers it only when a
+    # corner actually needs to inflate.
+    compressor = CompressorController(COMPRESSOR_PIN)
+    print("[compressor] idle (demand-based control)")
 
     adc = ADS1115()
     sensors = {name: PressureSensor(adc, SENSOR_CHANNELS[name]) for name in ACTIVE_CORNERS}
@@ -1060,6 +1011,8 @@ def main():
     threads.append(threading.Thread(
         target=display_loop, args=(device, corners, presets, lockout, warnings, stop_event), daemon=True))
     threads.append(threading.Thread(target=gps_worker, args=(lockout, stop_event), daemon=True))
+    threads.append(threading.Thread(
+        target=compressor_worker, args=(compressor, corners, stop_event), daemon=True))
 
     def shutdown(signum=None, frame=None):
         print("\n[system] Shutting down — closing all solenoids, stopping compressor...")
@@ -1067,8 +1020,7 @@ def main():
         time.sleep(0.2)
         for c in corners.values():
             c.cleanup()
-        compressor.off()
-        compressor.close()
+        compressor.cleanup()
         adc.close()
         device.cleanup()
         sys.exit(0)
