@@ -1,0 +1,184 @@
+4WD Tyre Pressure Monitor & Auto-Inflator — Raspberry Pi 5
+============================================================
+
+SYSTEM OVERVIEW
+============================================================
+- 1x SSD1309 OLED (I2C): 4WD outline with live pressure at each wheel,
+  a preset bar (ROAD/DIRT/SAND/CUSTOM) at the bottom, and a header
+  showing current GPS speed + lockout stage. Flashes full-screen
+  warnings for suspected punctures / compressor failure (see below).
+- 1x DFRobot Gravity ADS1115 4-channel ADC reading pressure sensors
+  (0.5-4.5V = 0-150psi), one sensor per tyre.
+- Air solenoids (inflate + deflate per corner) via relay/MOSFET boards.
+- 1x MOSFET power-switch module turning the air compressor on/off (it
+  has its own pressure-switch cutout, so the Pi just powers it on/off).
+- 3x momentary push buttons: UP, DOWN, SELECT (preset cycle / axle focus
+  / silence warnings — see WARNINGS section).
+- 1x u-blox NEO-6M GPS module (UART/NMEA) for speed-based lockout.
+
+============================================================
+SPEED-BASED LOCKOUT (2-stage)
+============================================================
+    Stage 0  (< 20 km/h)   : full access — all presets, all buttons.
+    Stage 1  (20-80 km/h)  : only ROAD/DIRT/SAND selectable (CUSTOM
+                              skipped). UP/DOWN can still fine-tune
+                              whichever is active.
+    Stage 2  (> 80 km/h)   : buttons fully locked out — UP/DOWN/SELECT
+                              do nothing (except silencing a warning —
+                              see below).
+
+  IMPORTANT: the lockout ONLY ever gates the buttons/UI. Sensor
+  monitoring and the automatic inflate/deflate control loop keep
+  running at every speed, including above 80 km/h — a tyre that's off
+  target keeps getting corrected regardless of lockout stage. "Locked
+  out" means the driver can't change settings while moving, not that
+  the system stops maintaining pressure.
+
+  FAIL-SAFE: no valid GPS fix, or no data for GPS_FIX_TIMEOUT_SECONDS,
+  -> speed treated as UNKNOWN -> falls back to Stage 2 (most
+  restrictive button lockout), never assumed to be 0 km/h.
+
+============================================================
+WARNINGS: puncture vs. possible compressor failure
+============================================================
+Previously a corner that couldn't reach its target within
+WARNING_TRIGGER_SECONDS just gave up and parked itself. That's been
+replaced with:
+
+  - The corner KEEPS TRYING indefinitely — it never stops attempting to
+    inflate a tyre that's losing pressure. There's no permanent "fault
+    lock" for this case anymore (sensor read errors / out-of-range
+    sensor voltages are still a hard fault, since there's no trustworthy
+    pressure data to safely act on at all).
+
+  - After WARNING_TRIGGER_SECONDS of continuously trying to inflate
+    without reaching target, the system tries to work out why:
+        * If a tyre on the OTHER axle is inflating/holding fine ->
+          this is a LOCAL problem -> "<POSITION> TYRE PUNCTURE".
+        * If no other-axle tyre can be confirmed working either ->
+          "POSSIBLE COMPRESSOR FAILURE" (system-wide, not tied to one
+          wheel).
+      (This is a simple heuristic based on whether other corners
+      currently have their own active warning, not an active
+      diagnostic test of the other axle — a reasonable first pass
+      given the hardware available.)
+      NOTE: with only one corner wired up for testing right now, there
+      is no "other axle" to check, so any prolonged inflate struggle on
+      the test corner will always resolve to "POSSIBLE COMPRESSOR
+      FAILURE" until a second corner (on the other axle) is wired in.
+
+  - Whichever warning fires, the OLED flashes it full-screen: white
+    background, black text, 2 seconds on / 2 seconds back to the
+    normal dashboard, looping for as long as the condition is active.
+    The flashing screen shows "Push any button to pause warning" in
+    small text at the bottom.
+
+  - Pressing ANY button while a warning is flashing silences the
+    flashing (that button press does nothing else — it's consumed by
+    the warning) and returns to the normal dashboard, but the affected
+    tyre's pressure reading is now shown in an inverted box (white box,
+    black text) as a persistent reminder. A possible-compressor-failure
+    warning, not being tied to one wheel, inverts the header bar
+    instead. This silencing works even during Stage-2 speed lockout,
+    since you should be able to silence a distracting warning at any
+    speed.
+
+  - The highlight/silence clears automatically once the underlying
+    problem actually resolves (pressure recovers, or another corner
+    proves air is flowing again).
+
+============================================================
+SENSOR FAULT DETECTION
+============================================================
+Each pressure sensor outputs 0.5-4.5V across 0-150psi. A reading OUTSIDE
+that band (below SENSOR_V_FAULT_LOW or above SENSOR_V_FAULT_HIGH) means
+the sensor is disconnected, shorted, or otherwise untrustworthy — NOT a
+genuine 0psi reading. Those are treated as a hard fault for that corner:
+solenoids close, the corner shows "ERR", and it does NOT inflate. This
+prevents the (now never-give-up) inflate loop from inflating blindly
+toward a wrong "0psi" reading from a dead sensor. The fault is
+self-healing — it clears automatically as soon as the sensor returns a
+valid in-band reading again. Each cycle also takes several samples and
+uses the median, to reject electrical noise around the tolerance band.
+
+============================================================
+COMPRESSOR CONTROL (demand-based)
+============================================================
+The compressor is no longer simply powered on for the whole time the Pi
+is running. Instead it is switched on only when at least one corner
+actually needs to inflate, and switched off again once demand ends (after
+a short linger period, COMPRESSOR_LINGER_SECONDS, so it doesn't rapidly
+chatter on/off between the inflate pulses). The compressor's own
+mechanical pressure-switch cutout still acts as the final backstop.
+
+============================================================
+THREAD SAFETY
+============================================================
+All corners share a single ADS1115 instance. An ADC read is a non-atomic
+write-config -> wait -> read-conversion sequence, so it is guarded by a
+lock — without it, two corner threads reading different channels at once
+would cross-wire their readings (and inflate/deflate the wrong tyre). The
+lock is a no-op cost with one corner wired, but is required as soon as a
+second corner is added.
+
+============================================================
+CURRENTLY WIRED FOR TESTING
+============================================================
+  Only ONE sensor + ONE inflate solenoid + ONE deflate solenoid are
+  physically connected right now (FL / front axle). See ACTIVE_CORNERS in
+  the script — add "FR", "RL", "RR" once those corners are wired; their
+  GPIO pins are already mapped out and ready to go.
+
+PRESETS:
+  Four named profiles (ROAD/DIRT/SAND/CUSTOM), each storing a front-axle
+  and rear-axle target psi, all fully editable from the buttons and
+  persisted across reboots in tyre_presets.json next to the script.
+
+============================================================
+WIRING
+============================================================
+Air compressor (MOSFET power switch module):
+    Pi GPIO4 -> module signal/IN pin
+
+Pressure sensors -> DFRobot Gravity ADS1115 (I2C, powered from Pi 5V,
+no divider needed):
+    FL sensor -> ADS1115 A0   FR sensor -> ADS1115 A1
+    RL sensor -> ADS1115 A2   RR sensor -> ADS1115 A3
+    ADS1115 SDA/SCL -> Pi SDA(GPIO2)/SCL(GPIO3), address 0x48 default
+
+Solenoids (each via its own relay/MOSFET driver -> 12V/24V supply):
+    FL inflate -> GPIO17   FL deflate -> GPIO27   (<- wired now)
+    FR inflate -> GPIO22   FR deflate -> GPIO23   (not yet wired)
+    RL inflate -> GPIO24   RL deflate -> GPIO25   (not yet wired)
+    RR inflate -> GPIO5    RR deflate -> GPIO6    (not yet wired)
+
+Buttons (momentary, wired to GPIO + GND, internal pull-up used):
+    UP -> GPIO16   DOWN -> GPIO26   SELECT -> GPIO13
+
+OLED display (SSD1309, I2C): shares the bus with the ADS1115 (different
+    address — typically 0x3C or 0x3D). Assumed 128x64 resolution.
+
+GPS (u-blox NEO-6M, UART/NMEA, 9600 baud default):
+    Module VCC -> Pi 3.3V (pin 1)  — do NOT use 5V, chip is 3.3V-only
+    Module GND -> Pi GND
+    Module TX  -> Pi RXD (GPIO15 / physical pin 10)
+    Module RX  -> not connected (only reading data, not configuring it)
+
+============================================================
+SETUP
+============================================================
+    sudo apt update
+    sudo apt install -y python3-lgpio python3-smbus i2c-tools fonts-dejavu-core
+    sudo raspi-config
+        # Interface Options -> I2C -> Enable
+        # Interface Options -> Serial Port ->
+        #     "login shell over serial?" -> No
+        #     "serial port hardware enabled?" -> Yes
+        # reboot afterwards
+    pip install gpiozero smbus2 luma.oled pillow pyserial pynmea2 --break-system-packages
+
+    i2cdetect -y 1     # confirm ADS1115 (0x48) and SSD1309 (0x3C/0x3D)
+    cat /dev/serial0    # should show $GPxxx NMEA sentences once GPS has a fix
+
+Run as a systemd service (tyre-inflator.service, provided) so the
+controller starts automatically at boot.

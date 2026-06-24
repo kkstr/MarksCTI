@@ -1,0 +1,6 @@
+gpiozero
+smbus2
+luma.oled
+pillow
+pyserial
+pynmea2

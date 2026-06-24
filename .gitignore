@@ -1,0 +1,12 @@
+# Runtime-generated preset state (persisted on the Pi)
+tyre_presets.json
+
+# Optional user assets (drop in alongside the script, not version-controlled)
+PixelOperator.ttf
+splash_logo.png
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
