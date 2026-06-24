@@ -5,18 +5,25 @@
 Full system overview, wiring, lockout/warning behaviour and setup notes
 live in OVERVIEW.txt next to this script. Quick summary:
 
-- Per-corner pressure monitoring via an ADS1115 ADC (0.5-4.5V = 0-150psi).
+- Per-corner pressure monitoring via an ADS1115 ADC (0.5-4.5V = 0-150psi),
+  with median sampling, out-of-band fault detection and I2C retries.
 - Automatic inflate/deflate to ROAD/DIRT/SAND/CUSTOM presets (front/rear
-  targets, persisted to tyre_presets.json).
-- SSD1309 OLED dashboard with a 4WD outline + flashing puncture /
-  compressor-failure warnings.
+  targets, persisted atomically to tyre_presets.json).
+- Absolute over-pressure guard (force-deflate above HARD_MAX_PSI) plus
+  inflate-struggle (puncture / compressor) and deflate-struggle warnings.
+- SSD1309 OLED dashboard with a 4WD outline + flashing warnings.
 - GPS speed-based 2-stage control lockout (UI only — regulation never
-  stops; fail-safe to the most restrictive stage with no fix).
-- Demand-based compressor control and self-healing sensor fault detection
-  (see CompressorController and SENSOR_V_FAULT_* below).
+  stops; fail-safe to the most restrictive stage with no fix), with serial
+  auto-reconnect.
+- Demand-based compressor control and self-healing sensor fault detection.
+
+Relay polarity: many relay/MOSFET boards are ACTIVE-LOW. Set
+SOLENOID_ACTIVE_HIGH / COMPRESSOR_ACTIVE_HIGH to match your hardware and
+bench-verify the de-energised state before connecting air.
 """
 
 import json
+import logging
 import os
 import signal
 import sys
@@ -31,6 +38,8 @@ from luma.oled.device import ssd1309
 import serial
 import pynmea2
 from PIL import Image, ImageFont
+
+log = logging.getLogger("cti")
 
 # Uses PixelOperator.ttf (a free pixel font) for the compact preset list,
 # if it's present next to this script. Falls back to PIL's built-in font
@@ -55,7 +64,7 @@ def _load_font(size: int):
     try:
         return ImageFont.truetype(PIXEL_FONT_PATH, size)
     except Exception as exc:
-        print(f"[display] could not load {PIXEL_FONT_PATH} ({exc}) — using built-in font instead")
+        log.warning(f"[display] could not load {PIXEL_FONT_PATH} ({exc}) — using built-in font instead")
         try:
             return ImageFont.load_default(size=size)
         except TypeError:
@@ -68,8 +77,8 @@ def _load_big_font(size: int):
             return ImageFont.truetype(path, size)
         except Exception:
             continue
-    print("[display] no bold monospace font found (try: sudo apt install fonts-dejavu-core) "
-          "— falling back to PixelOperator for pressure readings")
+    log.warning("[display] no bold monospace font found (try: sudo apt install fonts-dejavu-core) "
+                "— falling back to PixelOperator for pressure readings")
     return _load_font(size + 7)  # PixelOperator needs a larger size for similar visual height
 
 
@@ -87,6 +96,15 @@ CORNER_DISPLAY_NAME = {
     "FL": "FRONT LEFT", "FR": "FRONT RIGHT",
     "RL": "REAR LEFT", "RR": "REAR RIGHT",
 }
+
+# --- Relay/MOSFET driver polarity ---
+# True  = board energises the load on a HIGH signal (active-high).
+# False = board energises on a LOW signal (active-low — common on cheap
+#         opto-isolated relay boards). Either way, "off/closed" is the
+#         de-energised state at startup; set this to match your board and
+#         CONFIRM the de-energised state on the bench before piping air.
+SOLENOID_ACTIVE_HIGH = True
+COMPRESSOR_ACTIVE_HIGH = True
 
 # --- Compressor ---
 COMPRESSOR_PIN = 4
@@ -107,6 +125,7 @@ SOLENOID_PINS = {
 SENSOR_CHANNELS = {"FL": 0, "FR": 1, "RL": 2, "RR": 3}
 ADS1115_ADDR = 0x48
 ADS1115_BUS = 1
+ADS1115_READ_ATTEMPTS = 3   # retry a transient I2C glitch before faulting the corner
 
 # --- Which axle each corner belongs to (front pair / rear pair) ---
 CORNER_AXLE = {"FL": "front", "FR": "front", "RL": "rear", "RR": "rear"}
@@ -136,7 +155,13 @@ MAX_PSI = 60
 CHECK_INTERVAL_SECONDS = 3.0
 SETTLE_SECONDS = 1.0
 TOLERANCE_PSI = 1.0
-WARNING_TRIGGER_SECONDS = 180.0   # continuous unsuccessful inflate -> diagnose & warn
+WARNING_TRIGGER_SECONDS = 180.0   # continuous unsuccessful inflate/deflate -> diagnose & warn
+
+# Absolute over-pressure ceiling, INDEPENDENT of the selected preset target.
+# If a tyre ever exceeds this (runaway compressor pressure-switch, corrupted
+# target, etc.) the corner force-deflates and warns, regardless of its target.
+# Keep comfortably above MAX_PSI so normal regulation never trips it.
+HARD_MAX_PSI = 65.0
 
 # --- Presets: front/rear target psi, persisted to disk ---
 PRESET_ORDER = ["ROAD", "DIRT", "SAND", "CUSTOM"]
@@ -155,6 +180,7 @@ PRESET_SAVE_DEBOUNCE_SECONDS = 1.0
 GPS_PORT = "/dev/serial0"
 GPS_BAUD = 9600
 GPS_FIX_TIMEOUT_SECONDS = 5.0
+GPS_MAX_READ_ERRORS = 5   # consecutive read errors before reopening the serial port
 SPEED_STAGE1_MIN_KMH = 20.0
 SPEED_STAGE2_MIN_KMH = 80.0
 
@@ -179,11 +205,18 @@ class SensorFault(Exception):
     (disconnected / shorted) — there's no trustworthy pressure to act on."""
 
 
+def _interruptible_sleep(duration: float, stop_event: threading.Event):
+    stop_event.wait(timeout=duration)
+
+
 # ============================================================
 # Hardware: solenoid
 # ============================================================
 class AirSolenoid:
-    def __init__(self, pin: int, active_high: bool = True):
+    def __init__(self, pin: int, active_high: bool = SOLENOID_ACTIVE_HIGH):
+        # initial_value=False is always the de-energised (closed) state,
+        # regardless of active_high — gpiozero maps the logical level to the
+        # correct electrical level for the board polarity.
         self._device = OutputDevice(pin, active_high=active_high, initial_value=False)
         self.pin = pin
 
@@ -213,8 +246,8 @@ class CompressorController:
     rapid on/off chatter. The compressor's own pressure-switch cutout remains
     the final mechanical backstop. Starts OFF."""
 
-    def __init__(self, pin: int):
-        self._device = OutputDevice(pin, active_high=True, initial_value=False)
+    def __init__(self, pin: int, active_high: bool = COMPRESSOR_ACTIVE_HIGH):
+        self._device = OutputDevice(pin, active_high=active_high, initial_value=False)
         self._on = False
         self._last_demand = 0.0
 
@@ -225,11 +258,11 @@ class CompressorController:
             if not self._on:
                 self._device.on()
                 self._on = True
-                print("[compressor] ON (inflate demand)")
+                log.info("[compressor] ON (inflate demand)")
         elif self._on and (now - self._last_demand) >= COMPRESSOR_LINGER_SECONDS:
             self._device.off()
             self._on = False
-            print("[compressor] OFF (idle)")
+            log.info("[compressor] OFF (idle)")
 
     def cleanup(self):
         self._device.off()
@@ -251,6 +284,7 @@ class ADS1115:
     _REG_CONFIG = 0x01
     _REG_CONVERSION = 0x00
     _FULL_SCALE_VOLTS = 6.144  # PGA = 2/3x, covers our 0-4.5V signal directly
+    _CONVERSION_TIMEOUT = 0.05  # seconds to wait for a single-shot conversion
 
     def __init__(self, bus_num: int = ADS1115_BUS, address: int = ADS1115_ADDR):
         self._bus = SMBus(bus_num)
@@ -261,21 +295,38 @@ class ADS1115:
         # once would cross-wire their readings.
         self._lock = threading.Lock()
 
+    def _wait_conversion_ready(self):
+        # Poll the config register's OS bit (bit 15) rather than guessing a
+        # fixed delay, so changing the data-rate bits can't silently under-wait.
+        deadline = time.monotonic() + self._CONVERSION_TIMEOUT
+        while time.monotonic() < deadline:
+            cfg = self._bus.read_i2c_block_data(self._address, self._REG_CONFIG, 2)
+            if cfg[0] & 0x80:   # OS=1 -> conversion complete
+                return
+            time.sleep(0.001)
+        # Timed out — fall through and read whatever's there rather than hang.
+
     def read_voltage(self, channel: int) -> float:
         if channel not in (0, 1, 2, 3):
             raise ValueError("channel must be 0-3")
         mux = (4 + channel) << 12
         config = 0x8183 | mux
-        with self._lock:
-            self._bus.write_i2c_block_data(
-                self._address, self._REG_CONFIG, [(config >> 8) & 0xFF, config & 0xFF]
-            )
-            time.sleep(0.01)
-            data = self._bus.read_i2c_block_data(self._address, self._REG_CONVERSION, 2)
-        raw = (data[0] << 8) | data[1]
-        if raw > 32767:
-            raw -= 65536
-        return raw * (self._FULL_SCALE_VOLTS / 32768.0)
+        hi, lo = (config >> 8) & 0xFF, config & 0xFF
+        last_exc = None
+        for _ in range(ADS1115_READ_ATTEMPTS):
+            try:
+                with self._lock:
+                    self._bus.write_i2c_block_data(self._address, self._REG_CONFIG, [hi, lo])
+                    self._wait_conversion_ready()
+                    data = self._bus.read_i2c_block_data(self._address, self._REG_CONVERSION, 2)
+                raw = (data[0] << 8) | data[1]
+                if raw > 32767:
+                    raw -= 65536
+                return raw * (self._FULL_SCALE_VOLTS / 32768.0)
+            except OSError as exc:
+                last_exc = exc
+                time.sleep(0.002)   # brief backoff before retrying the bus
+        raise last_exc
 
     def close(self):
         self._bus.close()
@@ -346,21 +397,40 @@ class LockoutState:
 
 def gps_worker(lockout: LockoutState, stop_event: threading.Event):
     last_fix_monotonic = 0.0
-    try:
-        ser = serial.Serial(GPS_PORT, GPS_BAUD, timeout=1)
-    except Exception as exc:
-        print(f"[gps] could not open {GPS_PORT}: {exc} — staying in fail-safe lockout")
-        while not stop_event.is_set():
-            lockout.update(None, False)
-            stop_event.wait(timeout=GPS_FIX_TIMEOUT_SECONDS)
-        return
+    ser = None
+    consecutive_errors = 0
 
     while not stop_event.is_set():
+        # (Re)open the serial port as needed — recovers from an unplugged /
+        # browned-out GPS instead of getting stuck in fail-safe forever.
+        if ser is None:
+            try:
+                ser = serial.Serial(GPS_PORT, GPS_BAUD, timeout=1)
+                consecutive_errors = 0
+                log.info(f"[gps] opened {GPS_PORT}")
+            except Exception as exc:
+                log.warning(f"[gps] could not open {GPS_PORT}: {exc} — staying in fail-safe lockout")
+                lockout.update(None, False)
+                stop_event.wait(timeout=GPS_FIX_TIMEOUT_SECONDS)
+                continue
+
         try:
             raw = ser.readline().decode("ascii", errors="replace").strip()
+            consecutive_errors = 0
         except Exception as exc:
-            print(f"[gps] read error: {exc}")
+            consecutive_errors += 1
+            log.warning(f"[gps] read error: {exc}")
             raw = ""
+            if consecutive_errors >= GPS_MAX_READ_ERRORS:
+                log.warning("[gps] too many read errors — reopening serial port")
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser = None
+                lockout.update(None, False)
+                stop_event.wait(timeout=1.0)
+                continue
 
         if raw.startswith("$") and "RMC" in raw:
             try:
@@ -375,7 +445,8 @@ def gps_worker(lockout: LockoutState, stop_event: threading.Event):
         if time.monotonic() - last_fix_monotonic > GPS_FIX_TIMEOUT_SECONDS:
             lockout.update(None, False)
 
-    ser.close()
+    if ser is not None:
+        ser.close()
 
 
 # ============================================================
@@ -415,12 +486,27 @@ class PresetManager:
     def _save(self):
         with self._lock:
             snapshot = json.loads(json.dumps(self._presets))
+        # Write to a temp file then atomically replace, so a power loss
+        # mid-write can't corrupt tyre_presets.json (worst case the temp file
+        # is left behind; the real file is always whole).
+        tmp = self._path + ".tmp"
         try:
-            with open(self._path, "w") as f:
+            with open(tmp, "w") as f:
                 json.dump(snapshot, f, indent=2)
-            print(f"[presets] saved to {self._path}")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._path)
+            log.info(f"[presets] saved to {self._path}")
         except OSError as exc:
-            print(f"[presets] save failed: {exc}")
+            log.error(f"[presets] save failed: {exc}")
+
+    def flush(self):
+        """Cancel any pending debounced save and write immediately — used on
+        shutdown so a tweak made right before power-off isn't lost."""
+        if self._save_timer:
+            self._save_timer.cancel()
+            self._save_timer = None
+        self._save()
 
     def active_name(self) -> str:
         with self._lock:
@@ -447,19 +533,19 @@ class PresetManager:
                 self._active = order[(idx + 1) % len(order)]
             else:
                 self._active = order[0]
-            print(f"[presets] active preset -> {self._active}")
+            log.info(f"[presets] active preset -> {self._active}")
 
     def enforce_allowed(self, allowed):
         with self._lock:
             if allowed and self._active not in allowed:
                 old = self._active
                 self._active = allowed[0]
-                print(f"[presets] speed lockout: switched from {old} to {self._active}")
+                log.info(f"[presets] speed lockout: switched from {old} to {self._active}")
 
     def toggle_focus_axle(self):
         with self._lock:
             self._focus_axle = "rear" if self._focus_axle == "front" else "front"
-            print(f"[presets] editing axle -> {self._focus_axle}")
+            log.info(f"[presets] editing axle -> {self._focus_axle}")
 
     def adjust(self, delta: float):
         with self._lock:
@@ -467,65 +553,90 @@ class PresetManager:
             val = self._presets[self._active][axle] + delta
             val = max(MIN_PSI, min(MAX_PSI, val))
             self._presets[self._active][axle] = val
-            print(f"[presets] {self._active}.{axle} -> {val:.0f} psi")
+            log.info(f"[presets] {self._active}.{axle} -> {val:.0f} psi")
         self._schedule_save()
 
 
 # ============================================================
-# Warning manager: punctures (per corner) + possible compressor failure
+# Warning manager: per-corner punctures / over-pressure / stuck-deflate
+# plus a system-wide possible compressor failure
 # ============================================================
 class WarningManager:
-    """Tracks suspected punctures (per corner) and a system-wide possible
-    compressor-failure flag. Each warning has an 'active' state (the
-    underlying condition is currently true) and a 'paused' state (the
-    flashing has been silenced by a button press, but the condition
+    """Tracks per-corner warnings (puncture, over-pressure, won't-deflate) and
+    a system-wide possible compressor-failure flag. Each warning has an
+    'active' state (the underlying condition is currently true) and a 'paused'
+    state (the flashing has been silenced by a button press, but the condition
     hasn't necessarily resolved)."""
+
+    # Warning kind -> the two body lines shown on the full-screen flash.
+    PER_CORNER_KINDS = {
+        "PUNCTURE": "PUNCTURE",
+        "OVERPRESSURE": "OVER-PRESSURE",
+        "DEFLATE_STUCK": "WON'T DEFLATE",
+    }
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._punctures = {}                                  # name -> {"active","paused"}
+        # kind -> {corner_name -> {"active","paused"}}
+        self._corner = {k: {} for k in self.PER_CORNER_KINDS}
         self._compressor_failure = {"active": False, "paused": False}
 
-    def set_puncture(self, name: str, active: bool):
-        with self._lock:
-            existing = self._punctures.get(name, {"active": False, "paused": False})
-            if active and not existing["active"]:
-                print(f"[warning] PUNCTURE suspected: {name}")
-                self._punctures[name] = {"active": True, "paused": False}
-            elif not active and existing["active"]:
-                print(f"[warning] {name} puncture warning cleared")
-                self._punctures[name] = {"active": False, "paused": False}
-            elif active:
-                existing["active"] = True  # re-confirm, keep existing paused state
+    @staticmethod
+    def _set_flag(store, name, active, on_msg, off_msg):
+        existing = store.get(name, {"active": False, "paused": False})
+        if active and not existing["active"]:
+            log.info(on_msg)
+            store[name] = {"active": True, "paused": False}
+        elif not active and existing["active"]:
+            log.info(off_msg)
+            store[name] = {"active": False, "paused": False}
+        elif active:
+            existing["active"] = True   # re-confirm, keep existing paused state
+            store[name] = existing
 
-    def has_puncture(self, name: str) -> bool:
+    def _set(self, kind, name, active):
+        label = self.PER_CORNER_KINDS[kind]
         with self._lock:
-            entry = self._punctures.get(name)
+            self._set_flag(self._corner[kind], name, active,
+                           f"[warning] {label} suspected: {name}",
+                           f"[warning] {name} {label} warning cleared")
+
+    def _has(self, kind, name) -> bool:
+        with self._lock:
+            entry = self._corner[kind].get(name)
             return bool(entry and entry["active"])
+
+    # Convenience wrappers ------------------------------------------------
+    def set_puncture(self, name, active):      self._set("PUNCTURE", name, active)
+    def set_overpressure(self, name, active):  self._set("OVERPRESSURE", name, active)
+    def set_deflate_stuck(self, name, active): self._set("DEFLATE_STUCK", name, active)
+    def has_puncture(self, name) -> bool:      return self._has("PUNCTURE", name)
 
     def set_compressor_failure(self, active: bool):
         with self._lock:
             if active and not self._compressor_failure["active"]:
-                print("[warning] POSSIBLE COMPRESSOR FAILURE suspected")
+                log.info("[warning] POSSIBLE COMPRESSOR FAILURE suspected")
                 self._compressor_failure = {"active": True, "paused": False}
             elif not active and self._compressor_failure["active"]:
-                print("[warning] compressor failure warning cleared")
+                log.info("[warning] compressor failure warning cleared")
                 self._compressor_failure = {"active": False, "paused": False}
 
     def maybe_clear_compressor_failure(self, corner_names):
         with self._lock:
             if self._compressor_failure["active"]:
-                if any(not self._punctures.get(n, {}).get("active", False) for n in corner_names):
+                punctures = self._corner["PUNCTURE"]
+                if any(not punctures.get(n, {}).get("active", False) for n in corner_names):
                     self._compressor_failure = {"active": False, "paused": False}
-                    print("[warning] compressor failure warning cleared (air is flowing somewhere)")
+                    log.info("[warning] compressor failure warning cleared (air is flowing somewhere)")
 
     def pause_all(self) -> bool:
         with self._lock:
             paused_any = False
-            for entry in self._punctures.values():
-                if entry["active"] and not entry["paused"]:
-                    entry["paused"] = True
-                    paused_any = True
+            for store in self._corner.values():
+                for entry in store.values():
+                    if entry["active"] and not entry["paused"]:
+                        entry["paused"] = True
+                        paused_any = True
             if self._compressor_failure["active"] and not self._compressor_failure["paused"]:
                 self._compressor_failure["paused"] = True
                 paused_any = True
@@ -534,7 +645,11 @@ class WarningManager:
     def get_unpaused_active(self):
         """List of (kind, name_or_None) for warnings currently flashing."""
         with self._lock:
-            items = [("PUNCTURE", n) for n, e in self._punctures.items() if e["active"] and not e["paused"]]
+            items = []
+            for kind, store in self._corner.items():
+                for n, e in store.items():
+                    if e["active"] and not e["paused"]:
+                        items.append((kind, n))
             if self._compressor_failure["active"] and not self._compressor_failure["paused"]:
                 items.append(("COMPRESSOR_FAILURE", None))
             return items
@@ -545,7 +660,9 @@ class WarningManager:
     def get_paused_highlights(self):
         """(set of corner names to show inverted, compressor_failure_paused: bool)"""
         with self._lock:
-            names = {n for n, e in self._punctures.items() if e["active"] and e["paused"]}
+            names = set()
+            for store in self._corner.values():
+                names |= {n for n, e in store.items() if e["active"] and e["paused"]}
             comp = self._compressor_failure["active"] and self._compressor_failure["paused"]
             return names, comp
 
@@ -570,17 +687,14 @@ class TyreCorner:
         self.deflate.cleanup()
 
 
-def _interruptible_sleep(duration: float, stop_event: threading.Event):
-    stop_event.wait(timeout=duration)
-
-
 def corner_worker(corner: TyreCorner, corners: dict, presets: PresetManager,
                    warnings: WarningManager, stop_event: threading.Event):
     """Runs continuously for one tyre. Speed-based lockout (see
     LockoutState) only ever gates the buttons/UI — it does NOT pause
     this loop. Pressure is checked and inflate/deflate keeps running
     at every speed, including above the Stage-2 threshold."""
-    run_start = None  # when this corner started continuously trying to inflate
+    run_start = None       # when this corner started continuously trying to inflate
+    deflate_start = None   # when it started continuously trying to deflate
 
     while not stop_event.is_set():
         try:
@@ -590,18 +704,34 @@ def corner_worker(corner: TyreCorner, corners: dict, presets: PresetManager,
             # close solenoids and wait. Self-healing — the next valid reading
             # clears the fault automatically (no permanent latch).
             if not corner.fault:
-                print(f"[{corner.name}] sensor fault: {exc}")
+                log.warning(f"[{corner.name}] sensor fault: {exc}")
             corner.status = "FAULT"
             corner.fault = True
             corner.inflate.close()
             corner.deflate.close()
-            run_start = None
+            run_start = deflate_start = None
             _interruptible_sleep(CHECK_INTERVAL_SECONDS, stop_event)
             continue
 
         if corner.fault:
-            print(f"[{corner.name}] sensor recovered — resuming control")
+            log.info(f"[{corner.name}] sensor recovered — resuming control")
             corner.fault = False
+
+        # --- Absolute over-pressure guard (independent of preset target) ---
+        if corner.actual_psi > HARD_MAX_PSI:
+            if corner.status != "DEFLATE":
+                log.warning(f"[{corner.name}] OVER-PRESSURE {corner.actual_psi:.0f}psi "
+                            f"> {HARD_MAX_PSI:.0f} — force deflating")
+            corner.status = "DEFLATE"
+            run_start = deflate_start = None
+            warnings.set_overpressure(corner.name, True)
+            corner.inflate.close()
+            corner.deflate.open()
+            _interruptible_sleep(CHECK_INTERVAL_SECONDS, stop_event)
+            corner.deflate.close()
+            _interruptible_sleep(SETTLE_SECONDS, stop_event)
+            continue
+        warnings.set_overpressure(corner.name, False)
 
         target = presets.get_target(corner.axle)
         diff = target - corner.actual_psi
@@ -609,6 +739,8 @@ def corner_worker(corner: TyreCorner, corners: dict, presets: PresetManager,
         if diff > TOLERANCE_PSI:
             corner.status = "INFLATE"
             run_start = run_start or time.monotonic()
+            deflate_start = None
+            warnings.set_deflate_stuck(corner.name, False)
             corner.deflate.close()
             corner.inflate.open()
             _interruptible_sleep(CHECK_INTERVAL_SECONDS, stop_event)
@@ -617,7 +749,9 @@ def corner_worker(corner: TyreCorner, corners: dict, presets: PresetManager,
 
         elif diff < -TOLERANCE_PSI:
             corner.status = "DEFLATE"
+            deflate_start = deflate_start or time.monotonic()
             run_start = None
+            warnings.set_puncture(corner.name, False)
             corner.inflate.close()
             corner.deflate.open()
             _interruptible_sleep(CHECK_INTERVAL_SECONDS, stop_event)
@@ -626,10 +760,11 @@ def corner_worker(corner: TyreCorner, corners: dict, presets: PresetManager,
 
         else:
             corner.status = "OK"
-            run_start = None
+            run_start = deflate_start = None
             corner.inflate.close()
             corner.deflate.close()
             warnings.set_puncture(corner.name, False)
+            warnings.set_deflate_stuck(corner.name, False)
             warnings.maybe_clear_compressor_failure(corners.keys())
             _interruptible_sleep(CHECK_INTERVAL_SECONDS, stop_event)
 
@@ -644,9 +779,15 @@ def corner_worker(corner: TyreCorner, corners: dict, presets: PresetManager,
                 warnings.set_compressor_failure(True)
             run_start = time.monotonic()  # give it a fresh window before re-diagnosing
 
+        # Struggling to DEFLATE for too long? That's a local problem (a jammed
+        # deflate valve can't be a compressor issue) — flag it but keep trying.
+        if deflate_start and (time.monotonic() - deflate_start) > WARNING_TRIGGER_SECONDS:
+            warnings.set_deflate_stuck(corner.name, True)
+            deflate_start = time.monotonic()
+
 
 # ============================================================
-# OLED display: header + 4WD outline + preset bar + warning flashing
+# OLED display: 4WD outline + preset bar + warning flashing
 # ============================================================
 def load_splash_logo():
     """Loads the startup splash image, fitted to the full 128x64 screen
@@ -654,7 +795,7 @@ def load_splash_logo():
     None if no logo file is present / it failed to load — startup just
     skips the splash in that case."""
     if not os.path.exists(SPLASH_LOGO_PATH):
-        print(f"[display] no splash logo at {SPLASH_LOGO_PATH} — skipping splash screen")
+        log.info(f"[display] no splash logo at {SPLASH_LOGO_PATH} — skipping splash screen")
         return None
     try:
         img = Image.open(SPLASH_LOGO_PATH).convert("1")
@@ -665,7 +806,7 @@ def load_splash_logo():
         canvas_img.paste(img, (x, y))
         return canvas_img
     except Exception as exc:
-        print(f"[display] could not load splash logo ({exc}) — skipping splash screen")
+        log.warning(f"[display] could not load splash logo ({exc}) — skipping splash screen")
         return None
 
 
@@ -846,8 +987,9 @@ def render_warning_screen(draw, kind: str, name):
     W, H = OLED_WIDTH, OLED_HEIGHT
     draw.rectangle((0, 0, W, H), fill="white")
 
-    if kind == "PUNCTURE":
-        lines = ["**WARNING**", f"{CORNER_DISPLAY_NAME[name]} TYRE", "PUNCTURE"]
+    if kind in WarningManager.PER_CORNER_KINDS:
+        lines = ["**WARNING**", f"{CORNER_DISPLAY_NAME[name]} TYRE",
+                 WarningManager.PER_CORNER_KINDS[kind]]
     else:
         lines = ["**WARNING**", "POSSIBLE COMPRESSOR", "FAILURE"]
 
@@ -906,15 +1048,45 @@ def display_loop(device, corners: dict, presets: PresetManager,
 
 
 # ============================================================
+# Startup checks
+# ============================================================
+def check_pin_conflicts():
+    """Fail fast at startup if the wiring map double-books a GPIO pin (only
+    the actually-instantiated pins: active corners + compressor + buttons)."""
+    used = {}
+
+    def claim(pin, label):
+        if pin in used:
+            raise ValueError(f"GPIO pin conflict: '{label}' and '{used[pin]}' both use GPIO{pin}")
+        used[pin] = label
+
+    claim(COMPRESSOR_PIN, "compressor")
+    for name in ACTIVE_CORNERS:
+        claim(SOLENOID_PINS[name]["inflate"], f"{name} inflate")
+        claim(SOLENOID_PINS[name]["deflate"], f"{name} deflate")
+    claim(BUTTON_UP_PIN, "button UP")
+    claim(BUTTON_DOWN_PIN, "button DOWN")
+    claim(BUTTON_SELECT_PIN, "button SELECT")
+
+
+# ============================================================
 # Main
 # ============================================================
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     stop_event = threading.Event()
+
+    check_pin_conflicts()
 
     # Demand-based: starts OFF, the compressor thread powers it only when a
     # corner actually needs to inflate.
     compressor = CompressorController(COMPRESSOR_PIN)
-    print("[compressor] idle (demand-based control)")
+    log.info("[compressor] idle (demand-based control)")
 
     adc = ADS1115()
     sensors = {name: PressureSensor(adc, SENSOR_CHANNELS[name]) for name in ACTIVE_CORNERS}
@@ -943,7 +1115,7 @@ def main():
             warnings.pause_all()
             return
         if lockout.stage() >= 2:
-            print("[lockout] UP ignored — Stage 2 (speed lockout)")
+            log.info("[lockout] UP ignored — Stage 2 (speed lockout)")
             return
         presets.adjust(PSI_STEP)
 
@@ -952,7 +1124,7 @@ def main():
             warnings.pause_all()
             return
         if lockout.stage() >= 2:
-            print("[lockout] DOWN ignored — Stage 2 (speed lockout)")
+            log.info("[lockout] DOWN ignored — Stage 2 (speed lockout)")
             return
         presets.adjust(-PSI_STEP)
 
@@ -976,7 +1148,7 @@ def main():
             warnings.pause_all()
             return
         if lockout.stage() >= 2:
-            print("[lockout] SELECT(hold) ignored — Stage 2 (speed lockout)")
+            log.info("[lockout] SELECT(hold) ignored — Stage 2 (speed lockout)")
             return
         presets.toggle_focus_axle()
 
@@ -990,7 +1162,7 @@ def main():
             return
         stage = lockout.stage()
         if stage >= 2:
-            print("[lockout] SELECT ignored — Stage 2 (speed lockout)")
+            log.info("[lockout] SELECT ignored — Stage 2 (speed lockout)")
         else:
             allowed = STAGE1_ALLOWED_PRESETS if stage == 1 else None
             presets.cycle_preset(allowed=allowed)
@@ -1015,13 +1187,14 @@ def main():
         target=compressor_worker, args=(compressor, corners, stop_event), daemon=True))
 
     def shutdown(signum=None, frame=None):
-        print("\n[system] Shutting down — closing all solenoids, stopping compressor...")
+        log.info("[system] Shutting down — closing all solenoids, stopping compressor...")
         stop_event.set()
         time.sleep(0.2)
         for c in corners.values():
             c.cleanup()
         compressor.cleanup()
         adc.close()
+        presets.flush()
         device.cleanup()
         sys.exit(0)
 
@@ -1031,7 +1204,7 @@ def main():
     for t in threads:
         t.start()
 
-    print("[system] Running. Ctrl+C to stop.")
+    log.info("[system] Running. Ctrl+C to stop.")
     try:
         while True:
             time.sleep(1)

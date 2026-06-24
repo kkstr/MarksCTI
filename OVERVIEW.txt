@@ -3,10 +3,13 @@
 
 SYSTEM OVERVIEW
 ============================================================
-- 1x SSD1309 OLED (I2C): 4WD outline with live pressure at each wheel,
-  a preset bar (ROAD/DIRT/SAND/CUSTOM) at the bottom, and a header
-  showing current GPS speed + lockout stage. Flashes full-screen
-  warnings for suspected punctures / compressor failure (see below).
+- 1x SSD1309 OLED (I2C): 4WD outline with live pressure at each wheel and
+  a preset list (ROAD/DIRT/SAND/CUSTOM) down the right side. Flashes
+  full-screen warnings for punctures / over-pressure / stuck-deflate /
+  possible compressor failure (see below).
+  (There is no on-screen speed/stage header — the 128x64 panel is fully
+  occupied by the 4WD diagram, the F/R target labels and the preset list.
+  GPS speed and lockout stage drive behaviour internally but are not drawn.)
 - 1x DFRobot Gravity ADS1115 4-channel ADC reading pressure sensors
   (0.5-4.5V = 0-150psi), one sensor per tyre.
 - Air solenoids (inflate + deflate per corner) via relay/MOSFET boards.
@@ -78,10 +81,10 @@ replaced with:
     the warning) and returns to the normal dashboard, but the affected
     tyre's pressure reading is now shown in an inverted box (white box,
     black text) as a persistent reminder. A possible-compressor-failure
-    warning, not being tied to one wheel, inverts the header bar
-    instead. This silencing works even during Stage-2 speed lockout,
-    since you should be able to silence a distracting warning at any
-    speed.
+    warning, not being tied to one wheel, inverts the front/rear target
+    labels instead. This silencing works even during Stage-2 speed
+    lockout, since you should be able to silence a distracting warning at
+    any speed.
 
   - The highlight/silence clears automatically once the underlying
     problem actually resolves (pressure recovers, or another corner
@@ -100,6 +103,20 @@ toward a wrong "0psi" reading from a dead sensor. The fault is
 self-healing — it clears automatically as soon as the sensor returns a
 valid in-band reading again. Each cycle also takes several samples and
 uses the median, to reject electrical noise around the tolerance band.
+
+============================================================
+OVER-PRESSURE GUARD & STUCK-DEFLATE WARNING
+============================================================
+- Independently of the selected preset target, any corner reading above
+  HARD_MAX_PSI is treated as a runaway and force-deflated (compressor stays
+  off, deflate solenoid opens) with an "<POSITION> TYRE OVER-PRESSURE"
+  warning, until it drops back into range. HARD_MAX_PSI sits comfortably
+  above MAX_PSI so normal regulation never trips it.
+- The deflate path now has its own struggle warning, mirroring the inflate
+  one: a corner that can't reach target by DEFLATING within
+  WARNING_TRIGGER_SECONDS raises "<POSITION> TYRE WON'T DEFLATE" (a jammed
+  vent valve is always a local problem, so it's never attributed to the
+  compressor). It keeps trying regardless.
 
 ============================================================
 COMPRESSOR CONTROL (demand-based)
@@ -151,6 +168,13 @@ Solenoids (each via its own relay/MOSFET driver -> 12V/24V supply):
     FR inflate -> GPIO22   FR deflate -> GPIO23   (not yet wired)
     RL inflate -> GPIO24   RL deflate -> GPIO25   (not yet wired)
     RR inflate -> GPIO5    RR deflate -> GPIO6    (not yet wired)
+
+    RELAY POLARITY: many cheap opto-isolated relay boards are ACTIVE-LOW
+    (the load energises on a LOW signal). Set SOLENOID_ACTIVE_HIGH /
+    COMPRESSOR_ACTIVE_HIGH in the script to match your board. Either way the
+    de-energised (closed / compressor-off) state is what the code drives at
+    startup — but BENCH-VERIFY that nothing energises at power-on before
+    connecting air, since a wrong polarity setting would energise everything.
 
 Buttons (momentary, wired to GPIO + GND, internal pull-up used):
     UP -> GPIO16   DOWN -> GPIO26   SELECT -> GPIO13

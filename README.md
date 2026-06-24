@@ -17,14 +17,20 @@ controls above road speed.
 - **OLED dashboard** (SSD1309, 128×64): 4WD outline with live per-corner
   pressure, active preset, and full-screen flashing warnings.
 - **GPS speed-based lockout** (u-blox NEO-6M) in two stages so settings can't be
-  changed while driving — but pressure regulation never stops.
-- **Puncture vs. compressor-failure heuristic** with silenceable warnings.
+  changed while driving — but pressure regulation never stops. Serial port
+  auto-reconnects if the GPS drops out.
+- **Warnings** with silenceable full-screen flashes: puncture vs. possible
+  compressor-failure heuristic, absolute **over-pressure** force-deflate guard
+  (`HARD_MAX_PSI`), and a **stuck-deflate** ("won't deflate") warning.
 - **Demand-based compressor control** — the compressor runs only while a corner
   actually needs to inflate (with a short linger to avoid chatter), not for the
   whole time the Pi is powered.
 - **Self-healing sensor fault detection** — a sensor voltage outside its valid
   0.5–4.5 V band (disconnected/shorted) is treated as a fault (`ERR`, solenoids
   closed) instead of a bogus 0 psi, and clears automatically when it recovers.
+  ADC reads are median-sampled, I2C-retried, and serialised across corners.
+- **Configurable relay polarity** (`SOLENOID_ACTIVE_HIGH` /
+  `COMPRESSOR_ACTIVE_HIGH`) for active-high or active-low driver boards.
 
 Full system/wiring/setup detail lives in [`OVERVIEW.txt`](OVERVIEW.txt).
 
@@ -85,6 +91,16 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now tyre-inflator.service
 ```
 
+## Tests
+
+The pure control/state logic (`LockoutState`, `PresetManager`, `WarningManager`)
+is unit-tested with the hardware libraries stubbed, so the suite runs on any
+machine — no Raspberry Pi required:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
 ## Optional assets
 
 Drop these next to the script (they're gitignored):
@@ -97,8 +113,15 @@ Drop these next to the script (they're gitignored):
 This drives a live air system on a moving vehicle. Solenoids and the compressor
 default to **off/closed** at startup and are closed again on clean shutdown
 (`SIGINT`/`SIGTERM`). A failed or disconnected sensor faults its corner rather
-than inflating blindly. Bench-test each corner before trusting it on a wheel,
-and make sure your air hardware fails closed if power is lost.
+than inflating blindly, and an absolute over-pressure guard force-deflates a
+runaway corner regardless of its target.
+
+⚠️ **Confirm your relay/MOSFET board polarity first.** Many opto-isolated relay
+boards are active-low; if `SOLENOID_ACTIVE_HIGH` / `COMPRESSOR_ACTIVE_HIGH` don't
+match your hardware, the "off" state at boot could energise everything. Set them
+correctly and bench-verify nothing energises at power-on **before** connecting
+air. Bench-test each corner before trusting it on a wheel, and make sure your air
+hardware fails closed if power is lost.
 
 ## License
 
