@@ -119,14 +119,36 @@ OVER-PRESSURE GUARD & STUCK-DEFLATE WARNING
   compressor). It keeps trying regardless.
 
 ============================================================
-COMPRESSOR CONTROL (demand-based)
+COMPRESSOR + AIR TANK (tank-pressure controlled)
 ============================================================
-The compressor is no longer simply powered on for the whole time the Pi
-is running. Instead it is switched on only when at least one corner
-actually needs to inflate, and switched off again once demand ends (after
-a short linger period, COMPRESSOR_LINGER_SECONDS, so it doesn't rapidly
-chatter on/off between the inflate pulses). The compressor's own
-mechanical pressure-switch cutout still acts as the final backstop.
+The compressor and the corner solenoids are DECOUPLED. The compressor's
+only job is to keep an air TANK charged; the corner solenoids draw from
+that tank on demand, independently.
+
+A dedicated tank pressure sensor drives the compressor with hysteresis
+(TankController): the compressor turns ON at/below TANK_PRESSURE_CUT_IN
+and OFF at/above TANK_PRESSURE_CUT_OUT (e.g. on <=90, off >=120 psi). Run
+the tank well above your highest tyre target so fills stay fast.
+
+Diagnostics the tank sensor enables:
+  - If the compressor runs longer than TANK_FILL_TIMEOUT_SECONDS without
+    reaching cut-out, that's a failing pump or a major leak -> "POSSIBLE
+    COMPRESSOR FAILURE".
+  - If the tank sensor itself can't be read, the compressor is STOPPED as
+    a fail-safe (don't run blind) and the same warning is raised.
+  - A corner that can't reach target while the tank is healthy
+    (TANK_SUPPLY_MIN_PSI+) is therefore a LOCAL problem -> puncture/valve,
+    not the compressor. (This replaces the older "is the other axle ok?"
+    guess with a real supply-pressure signal.)
+
+ALWAYS keep a mechanical pressure switch wired as the hardware backstop,
+set just above TANK_PRESSURE_CUT_OUT, plus a tank safety relief valve, in
+case the sensor or software ever fails high.
+
+Air plumbing checklist: tank rated for working pressure and vibration-
+mounted; safety relief valve on the tank; check valve compressor->tank;
+drain valve at the tank's low point (moisture); water trap/desiccant
+downstream before the solenoid manifold; deflate vents to atmosphere.
 
 ============================================================
 THREAD SAFETY
@@ -156,12 +178,29 @@ WIRING
 ============================================================
 Air compressor (MOSFET power switch module):
     Pi GPIO4 -> module signal/IN pin
+    The Pi only ENABLES the compressor; tank pressure (below) decides when it
+    actually runs. For a high-current compressor, the MOSFET module should
+    switch a properly-rated automotive relay/contactor that carries the pump
+    on its own heavy-gauge, fused wiring near the battery — not the Pi rail.
+    Keep a mechanical pressure switch in the circuit as the hardware backstop.
 
-Pressure sensors -> DFRobot Gravity ADS1115 (I2C, powered from Pi 5V,
-no divider needed):
+Corner pressure sensors -> DFRobot Gravity ADS1115 (I2C):
     FL sensor -> ADS1115 A0   FR sensor -> ADS1115 A1
     RL sensor -> ADS1115 A2   RR sensor -> ADS1115 A3
     ADS1115 SDA/SCL -> Pi SDA(GPIO2)/SCL(GPIO3), address 0x48 default
+
+Tank pressure sensor (drives compressor control):
+    Tank sensor -> ADS1115 channel TANK_SENSOR_CHANNEL at TANK_SENSOR_ADDR.
+    Bench (only FL wired): share the 0x48 board on a free channel (A1 default).
+    Production (all 4 corners on A0-A3): fit a SECOND ADS1115 with its ADDR pin
+    tied to VDD (address 0x49) and set TANK_SENSOR_ADDR = 0x49, channel A0.
+
+NOTE on sensor supply voltage: a 0.5-4.5V sensor read directly needs the
+ADS1115 at ~5V, which puts 5V on the shared I2C bus into the Pi's 3.3V-only
+GPIO2/3. Prefer running the ADS1115 (and OLED) at 3.3V; if the sensors are
+RATIOMETRIC, power them at 3.3V too (range scales to ~0.33-2.97V, no divider —
+adjust SENSOR_V_MIN / PSI_PER_VOLT) — otherwise add a divider on each signal or
+an I2C level shifter. Confirm your sensor type before wiring.
 
 Solenoids (each via its own relay/MOSFET driver -> 12V/24V supply):
     FL inflate -> GPIO17   FL deflate -> GPIO27   (<- wired now)

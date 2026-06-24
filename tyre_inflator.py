@@ -15,7 +15,9 @@ live in OVERVIEW.txt next to this script. Quick summary:
 - GPS speed-based 2-stage control lockout (UI only — regulation never
   stops; fail-safe to the most restrictive stage with no fix), with serial
   auto-reconnect.
-- Demand-based compressor control and self-healing sensor fault detection.
+- Tank-pressure compressor control (hysteresis), fully decoupled from the
+  corner solenoids, plus self-healing sensor fault detection. The corner
+  solenoids draw from a charged air tank on demand.
 
 Relay polarity: many relay/MOSFET boards are ACTIVE-LOW. Set
 SOLENOID_ACTIVE_HIGH / COMPRESSOR_ACTIVE_HIGH to match your hardware and
@@ -106,12 +108,29 @@ CORNER_DISPLAY_NAME = {
 SOLENOID_ACTIVE_HIGH = True
 COMPRESSOR_ACTIVE_HIGH = True
 
-# --- Compressor ---
+# --- Compressor + air tank ---
+# The compressor and the corner solenoids are DECOUPLED. The compressor's only
+# job is to keep the air TANK charged, controlled by a tank pressure sensor with
+# hysteresis (on at CUT_IN, off at CUT_OUT). The corner solenoids draw from the
+# tank on demand, independently. Keep a mechanical pressure switch wired as a
+# hardware backstop, set just above TANK_PRESSURE_CUT_OUT, in case the sensor or
+# software ever fails high.
 COMPRESSOR_PIN = 4
-COMPRESSOR_LINGER_SECONDS = 5.0   # keep running this long after inflate demand
-                                   # ends, so it doesn't chatter on/off between
-                                   # the individual inflate pulses
-COMPRESSOR_POLL_SECONDS = 0.5      # how often the compressor thread re-checks demand
+TANK_PRESSURE_CUT_IN = 90.0      # turn compressor ON at/below this tank psi
+TANK_PRESSURE_CUT_OUT = 120.0    # turn compressor OFF at/above this tank psi
+TANK_SUPPLY_MIN_PSI = 50.0       # below this the tank can't reliably feed an air-up
+TANK_FILL_TIMEOUT_SECONDS = 120.0  # compressor running this long without reaching
+                                    # CUT_OUT -> suspect compressor failure / big leak
+TANK_POLL_SECONDS = 1.0
+
+# Tank pressure sensor location on the ADC. For bench testing with one ADS1115
+# (corners on A0-A3, but only FL wired) the tank can share that board on a free
+# channel. Once all four corners occupy 0x48 A0-A3, move the tank sensor to a
+# SECOND ADS1115 (ADDR pin -> VDD = address 0x49) and update TANK_SENSOR_ADDR.
+# Assumes the same 0.5-4.5V = 0-150psi calibration as the corner sensors; adjust
+# the SENSOR_* constants if your tank sensor's range differs.
+TANK_SENSOR_ADDR = 0x48
+TANK_SENSOR_CHANNEL = 1
 
 # --- Solenoid GPIO pins, per corner (all 4 defined; only ACTIVE_CORNERS used) ---
 SOLENOID_PINS = {
@@ -236,45 +255,74 @@ class AirSolenoid:
 
 
 # ============================================================
-# Hardware: compressor power switch (demand-based control)
+# Hardware: compressor + air tank (tank-pressure controlled)
 # ============================================================
-class CompressorController:
-    """Powers the compressor only while inflation is actually needed.
+class TankController:
+    """Keeps the air tank charged from a tank pressure sensor using simple
+    hysteresis, decoupled from the corner solenoids: compressor ON at/below
+    TANK_PRESSURE_CUT_IN, OFF at/above TANK_PRESSURE_CUT_OUT. Starts OFF.
 
-    Turns on the moment demand appears; turns off COMPRESSOR_LINGER_SECONDS
-    after demand last seen, so brief gaps between inflate pulses don't cause
-    rapid on/off chatter. The compressor's own pressure-switch cutout remains
-    the final mechanical backstop. Starts OFF."""
+    Raises the system-wide compressor-failure warning if the tank can't reach
+    CUT_OUT within TANK_FILL_TIMEOUT_SECONDS (failing pump / big leak), and on
+    a tank-sensor fault stops the pump as a fail-safe. A mechanical pressure
+    switch should still be wired as the hardware backstop."""
 
-    def __init__(self, pin: int, active_high: bool = COMPRESSOR_ACTIVE_HIGH):
+    def __init__(self, pin: int, sensor: "PressureSensor",
+                 active_high: bool = COMPRESSOR_ACTIVE_HIGH):
         self._device = OutputDevice(pin, active_high=active_high, initial_value=False)
+        self._sensor = sensor
         self._on = False
-        self._last_demand = 0.0
+        self._fill_start = None
+        self.tank_psi = 0.0
+        self.fault = False
 
-    def request(self, demand: bool):
-        now = time.monotonic()
-        if demand:
-            self._last_demand = now
-            if not self._on:
-                self._device.on()
-                self._on = True
-                log.info("[compressor] ON (inflate demand)")
-        elif self._on and (now - self._last_demand) >= COMPRESSOR_LINGER_SECONDS:
-            self._device.off()
-            self._on = False
-            log.info("[compressor] OFF (idle)")
+    def _set(self, on: bool, reason: str):
+        if on != self._on:
+            (self._device.on if on else self._device.off)()
+            self._on = on
+            log.info(f"[compressor] {'ON' if on else 'OFF'} ({reason})")
+
+    def update(self, warnings: "WarningManager"):
+        try:
+            self.tank_psi = self._sensor.read_psi()
+            self.fault = False
+        except Exception as exc:
+            if not self.fault:
+                log.warning(f"[tank] sensor fault: {exc} — stopping compressor (fail-safe)")
+            self.fault = True
+            self._set(False, "tank sensor fault")
+            self._fill_start = None
+            warnings.set_compressor_failure(True)
+            return
+
+        if not self._on and self.tank_psi <= TANK_PRESSURE_CUT_IN:
+            self._set(True, f"tank {self.tank_psi:.0f} <= {TANK_PRESSURE_CUT_IN:.0f}")
+            self._fill_start = time.monotonic()
+        elif self._on and self.tank_psi >= TANK_PRESSURE_CUT_OUT:
+            self._set(False, f"tank {self.tank_psi:.0f} >= {TANK_PRESSURE_CUT_OUT:.0f}")
+            self._fill_start = None
+            warnings.set_compressor_failure(False)
+
+        # Running a long time without reaching cut-out -> failing pump / leak.
+        if (self._on and self._fill_start
+                and (time.monotonic() - self._fill_start) > TANK_FILL_TIMEOUT_SECONDS):
+            warnings.set_compressor_failure(True)
+
+    def tank_ok(self) -> bool:
+        """True when the tank can currently supply an air-up (sensor healthy
+        and above the usable-supply floor)."""
+        return (not self.fault) and self.tank_psi >= TANK_SUPPLY_MIN_PSI
 
     def cleanup(self):
         self._device.off()
         self._device.close()
 
 
-def compressor_worker(controller: CompressorController, corners: dict,
-                      stop_event: threading.Event):
+def tank_worker(controller: "TankController", warnings: "WarningManager",
+                stop_event: threading.Event):
     while not stop_event.is_set():
-        demand = any(c.status == "INFLATE" for c in corners.values())
-        controller.request(demand)
-        _interruptible_sleep(COMPRESSOR_POLL_SECONDS, stop_event)
+        controller.update(warnings)
+        _interruptible_sleep(TANK_POLL_SECONDS, stop_event)
 
 
 # ============================================================
@@ -621,14 +669,6 @@ class WarningManager:
                 log.info("[warning] compressor failure warning cleared")
                 self._compressor_failure = {"active": False, "paused": False}
 
-    def maybe_clear_compressor_failure(self, corner_names):
-        with self._lock:
-            if self._compressor_failure["active"]:
-                punctures = self._corner["PUNCTURE"]
-                if any(not punctures.get(n, {}).get("active", False) for n in corner_names):
-                    self._compressor_failure = {"active": False, "paused": False}
-                    log.info("[warning] compressor failure warning cleared (air is flowing somewhere)")
-
     def pause_all(self) -> bool:
         with self._lock:
             paused_any = False
@@ -687,8 +727,9 @@ class TyreCorner:
         self.deflate.cleanup()
 
 
-def corner_worker(corner: TyreCorner, corners: dict, presets: PresetManager,
-                   warnings: WarningManager, stop_event: threading.Event):
+def corner_worker(corner: TyreCorner, presets: PresetManager,
+                   warnings: WarningManager, tank: "TankController",
+                   stop_event: threading.Event):
     """Runs continuously for one tyre. Speed-based lockout (see
     LockoutState) only ever gates the buttons/UI — it does NOT pause
     this loop. Pressure is checked and inflate/deflate keeps running
@@ -765,18 +806,16 @@ def corner_worker(corner: TyreCorner, corners: dict, presets: PresetManager,
             corner.deflate.close()
             warnings.set_puncture(corner.name, False)
             warnings.set_deflate_stuck(corner.name, False)
-            warnings.maybe_clear_compressor_failure(corners.keys())
             _interruptible_sleep(CHECK_INTERVAL_SECONDS, stop_event)
 
-        # Struggling to inflate for too long? Diagnose, warn, but KEEP TRYING —
-        # no permanent lock for this case, just a flag and a re-check later.
+        # Struggling to inflate for too long? With a charged tank the supply is
+        # known-good, so a corner that still can't reach target is a LOCAL
+        # problem (puncture / stuck valve). If the tank itself is low or failed,
+        # the TankController owns the system-wide compressor-failure warning, so
+        # don't double-report here. KEEP TRYING either way (no permanent lock).
         if run_start and (time.monotonic() - run_start) > WARNING_TRIGGER_SECONDS:
-            other_axle_names = [n for n, c in corners.items() if c.axle != corner.axle]
-            other_axle_healthy = any(not warnings.has_puncture(n) for n in other_axle_names)
-            if other_axle_names and other_axle_healthy:
+            if tank.tank_ok():
                 warnings.set_puncture(corner.name, True)
-            else:
-                warnings.set_compressor_failure(True)
             run_start = time.monotonic()  # give it a fresh window before re-diagnosing
 
         # Struggling to DEFLATE for too long? That's a local problem (a jammed
@@ -1083,13 +1122,23 @@ def main():
 
     check_pin_conflicts()
 
-    # Demand-based: starts OFF, the compressor thread powers it only when a
-    # corner actually needs to inflate.
-    compressor = CompressorController(COMPRESSOR_PIN)
-    log.info("[compressor] idle (demand-based control)")
+    # One ADS1115 per distinct I2C address — the corner sensors share
+    # ADS1115_ADDR; the tank sensor may share that board or live on a second one.
+    adcs = {}
 
-    adc = ADS1115()
-    sensors = {name: PressureSensor(adc, SENSOR_CHANNELS[name]) for name in ACTIVE_CORNERS}
+    def get_adc(addr):
+        if addr not in adcs:
+            adcs[addr] = ADS1115(address=addr)
+        return adcs[addr]
+
+    sensors = {name: PressureSensor(get_adc(ADS1115_ADDR), SENSOR_CHANNELS[name])
+               for name in ACTIVE_CORNERS}
+
+    # Compressor is tank-pressure controlled, independent of the solenoids.
+    tank_sensor = PressureSensor(get_adc(TANK_SENSOR_ADDR), TANK_SENSOR_CHANNEL)
+    compressor = TankController(COMPRESSOR_PIN, tank_sensor)
+    log.info(f"[compressor] tank-pressure control "
+             f"(on <= {TANK_PRESSURE_CUT_IN:.0f}, off >= {TANK_PRESSURE_CUT_OUT:.0f} psi)")
 
     corners = {}
     for name in ACTIVE_CORNERS:
@@ -1176,7 +1225,7 @@ def main():
 
     threads = [
         threading.Thread(target=corner_worker,
-                          args=(corners[n], corners, presets, warnings, stop_event),
+                          args=(corners[n], presets, warnings, compressor, stop_event),
                           daemon=True)
         for n in corners
     ]
@@ -1184,7 +1233,7 @@ def main():
         target=display_loop, args=(device, corners, presets, lockout, warnings, stop_event), daemon=True))
     threads.append(threading.Thread(target=gps_worker, args=(lockout, stop_event), daemon=True))
     threads.append(threading.Thread(
-        target=compressor_worker, args=(compressor, corners, stop_event), daemon=True))
+        target=tank_worker, args=(compressor, warnings, stop_event), daemon=True))
 
     def shutdown(signum=None, frame=None):
         log.info("[system] Shutting down — closing all solenoids, stopping compressor...")
@@ -1193,7 +1242,8 @@ def main():
         for c in corners.values():
             c.cleanup()
         compressor.cleanup()
-        adc.close()
+        for adc in adcs.values():
+            adc.close()
         presets.flush()
         device.cleanup()
         sys.exit(0)

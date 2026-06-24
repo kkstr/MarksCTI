@@ -132,16 +132,65 @@ class TestWarningManager(unittest.TestCase):
         self.assertIn(("OVERPRESSURE", "FL"), active)
         self.assertIn(("DEFLATE_STUCK", "RR"), active)
 
-    def test_compressor_failure_clears_when_a_corner_is_healthy(self):
+    def test_compressor_failure_set_and_clear(self):
         self.wm.set_compressor_failure(True)
-        # FL has no puncture -> air is flowing somewhere -> should clear.
-        self.wm.maybe_clear_compressor_failure(["FL"])
+        self.assertIn(("COMPRESSOR_FAILURE", None), self.wm.get_unpaused_active())
+        self.wm.set_compressor_failure(False)
         self.assertEqual(self.wm.get_unpaused_active(), [])
 
-    def test_compressor_failure_persists_when_all_punctured(self):
-        self.wm.set_puncture("FL", True)
-        self.wm.set_compressor_failure(True)
-        self.wm.maybe_clear_compressor_failure(["FL"])
+
+class _FakeSensor:
+    """Stand-in for PressureSensor with a settable reading / forced fault."""
+    def __init__(self, psi=0.0):
+        self.psi = psi
+        self.raise_exc = None
+
+    def read_psi(self):
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return self.psi
+
+
+class TestTankController(unittest.TestCase):
+    def setUp(self):
+        self.wm = ti.WarningManager()
+        self.sensor = _FakeSensor(psi=ti.TANK_PRESSURE_CUT_IN - 10)  # start low
+        self.tc = ti.TankController(ti.COMPRESSOR_PIN, self.sensor)
+
+    def test_hysteresis_on_off(self):
+        self.tc.update(self.wm)
+        self.assertTrue(self.tc._on)                       # low -> on
+        self.sensor.psi = (ti.TANK_PRESSURE_CUT_IN + ti.TANK_PRESSURE_CUT_OUT) / 2
+        self.tc.update(self.wm)
+        self.assertTrue(self.tc._on)                       # mid-band -> stays on
+        self.sensor.psi = ti.TANK_PRESSURE_CUT_OUT + 5
+        self.tc.update(self.wm)
+        self.assertFalse(self.tc._on)                      # at/above cut-out -> off
+        self.sensor.psi = ti.TANK_PRESSURE_CUT_IN - 5
+        self.tc.update(self.wm)
+        self.assertTrue(self.tc._on)                       # back below cut-in -> on
+
+    def test_tank_ok_floor(self):
+        self.sensor.psi = ti.TANK_SUPPLY_MIN_PSI + 1
+        self.tc.update(self.wm)
+        self.assertTrue(self.tc.tank_ok())
+        self.sensor.psi = ti.TANK_SUPPLY_MIN_PSI - 1
+        self.tc.update(self.wm)
+        self.assertFalse(self.tc.tank_ok())
+
+    def test_sensor_fault_stops_pump_and_warns(self):
+        self.sensor.raise_exc = ti.SensorFault("disconnected")
+        self.tc.update(self.wm)
+        self.assertTrue(self.tc.fault)
+        self.assertFalse(self.tc._on)
+        self.assertFalse(self.tc.tank_ok())
+        self.assertIn(("COMPRESSOR_FAILURE", None), self.wm.get_unpaused_active())
+
+    def test_fill_timeout_flags_compressor_failure(self):
+        self.tc.update(self.wm)                            # low -> on, starts fill timer
+        self.assertTrue(self.tc._on)
+        self.tc._fill_start -= ti.TANK_FILL_TIMEOUT_SECONDS + 1   # pretend it's been ages
+        self.tc.update(self.wm)                            # still below cut-out
         self.assertIn(("COMPRESSOR_FAILURE", None), self.wm.get_unpaused_active())
 
 

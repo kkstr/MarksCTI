@@ -22,9 +22,12 @@ controls above road speed.
 - **Warnings** with silenceable full-screen flashes: puncture vs. possible
   compressor-failure heuristic, absolute **over-pressure** force-deflate guard
   (`HARD_MAX_PSI`), and a **stuck-deflate** ("won't deflate") warning.
-- **Demand-based compressor control** — the compressor runs only while a corner
-  actually needs to inflate (with a short linger to avoid chatter), not for the
-  whole time the Pi is powered.
+- **Tank-pressure compressor control** — the compressor is decoupled from the
+  solenoids and kept charging an air tank via a dedicated tank pressure sensor
+  with hysteresis (on ≤ `TANK_PRESSURE_CUT_IN`, off ≥ `TANK_PRESSURE_CUT_OUT`).
+  A tank that won't fill, or a tank-sensor fault, raises a compressor-failure
+  warning (and a sensor fault stops the pump as a fail-safe). The corner
+  solenoids draw from the tank on demand.
 - **Self-healing sensor fault detection** — a sensor voltage outside its valid
   0.5–4.5 V band (disconnected/shorted) is treated as a fault (`ERR`, solenoids
   closed) instead of a bogus 0 psi, and clears automatically when it recovers.
@@ -61,8 +64,18 @@ for the full pin map. Summary:
 | ADS1115 / OLED (I2C)| SDA 2, SCL 3 |
 | GPS RX (Pi RXD)     | 15   |
 
+Corner sensors use ADS1115 channels A0–A3 (addr `0x48`). The **tank pressure
+sensor** uses `TANK_SENSOR_ADDR` / `TANK_SENSOR_CHANNEL` — share the `0x48` board
+on a free channel for bench testing, or fit a **second ADS1115 at `0x49`** once
+all four corners occupy A0–A3.
+
 > **Currently wired for testing:** only the `FL` corner. Add `"FR"`, `"RL"`,
 > `"RR"` to `ACTIVE_CORNERS` in the script as each corner is wired.
+>
+> **I2C sensor supply:** a 0.5–4.5 V sensor read directly wants the ADS1115 at
+> 5 V, which exposes the Pi's 3.3 V I2C pins to 5 V. Prefer 3.3 V on the bus; if
+> the sensors are ratiometric, run them at 3.3 V too (and adjust `SENSOR_V_MIN` /
+> `PSI_PER_VOLT`), otherwise add a divider or an I2C level shifter.
 
 ## Setup
 
@@ -122,6 +135,11 @@ match your hardware, the "off" state at boot could energise everything. Set them
 correctly and bench-verify nothing energises at power-on **before** connecting
 air. Bench-test each corner before trusting it on a wheel, and make sure your air
 hardware fails closed if power is lost.
+
+The software tank control is **not** the only safeguard on the air system: fit a
+**mechanical pressure switch** (backstop above `TANK_PRESSURE_CUT_OUT`) and a
+**tank safety relief valve**, plus a check valve, tank drain and water trap. See
+[`OVERVIEW.txt`](OVERVIEW.txt) for the full air-plumbing checklist.
 
 ## License
 
